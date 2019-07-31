@@ -2,6 +2,7 @@
 
 #include <c10/util/Exception.h>
 #include <torch/csrc/jit/constants.h>
+#include <torch/csrc/jit/function.h>
 #include <torch/csrc/jit/operator.h>
 #include <torch/csrc/jit/passes/python_print.h>
 #include <torch/csrc/jit/script/schema_matching.h>
@@ -992,6 +993,7 @@ Node::Node(Graph* graph_, NodeKind kind_)
       graph_(graph_),
       owning_block_(nullptr),
       scope_(graph_->current_scope_),
+      callstack_(c10::nullopt),
       schema_(nullptr),
       topo_position_(0) {
   graph_->all_nodes.emplace(this);
@@ -1565,6 +1567,22 @@ void Graph::freeBlock(Block* b) {
   all_blocks.erase(it);
 }
 
+void Node::insertCallStackEntry(Function* f, SourceRange sr) {
+  if (!callstack_) {
+    callstack_ = c10::make_intrusive<CallStack>(f, sr);
+  } else {
+    callstack_ = (*callstack_)->insertCallStackEntry(f, sr);
+  }
+}
+
+void Node::appendCallStackOf(Node* other) {
+  if (other->callstack_) {
+    for (auto& e : (*other->callstack_)->asVector()) {
+      insertCallStackEntry(e.first, e.second);
+    }
+  }
+}
+
 at::ArrayRef<Value*> createTupleUnpack(Value* v) {
   // small peephole optimization to ensure IntArrayRef attributes can still turn
   // into constants e.g. in x.expand([3, 4])
@@ -1577,8 +1595,19 @@ at::ArrayRef<Value*> createTupleUnpack(Value* v) {
 
 std::vector<Value*> inlineCallTo(Node* to_replace, Function* callee) {
   WithInsertPoint guard(to_replace);
+  std::unordered_map<Node*, Node*> node_map;
   auto new_outputs = insertGraph(
-      *to_replace->owningGraph(), *(callee->graph()), to_replace->inputs());
+      *to_replace->owningGraph(),
+      *(callee->graph()),
+      to_replace->inputs(),
+      node_map);
+
+  for (const auto& kv : node_map) {
+    Node* orig_node = kv.first;
+    Node* new_node = kv.second;
+    new_node->insertCallStackEntry(callee, to_replace->sourceRange());
+    new_node->appendCallStackOf(orig_node);
+  }
 
   const auto& old_outputs = to_replace->outputs();
 
